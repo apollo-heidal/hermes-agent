@@ -5503,8 +5503,96 @@ class HermesCLI:
         except Exception:
             logger.debug("Edit snapshot capture failed for %s", function_name, exc_info=True)
 
+    def _tool_result_succeeded(self, function_result: str | None) -> bool:
+        """Conservatively detect whether a tool result represents success."""
+        if not function_result:
+            return False
+        try:
+            data = json.loads(function_result)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        if data.get("error"):
+            return False
+        if "success" in data:
+            return bool(data.get("success"))
+        return True
+
+    def _plan_preview_path_from_tool_result(
+        self,
+        function_name: str,
+        function_args: dict | None,
+        function_result: str | None,
+    ) -> Path | None:
+        """Return a plan markdown path eligible for glow preview, if any."""
+        if function_name != "write_file":
+            return None
+        if not isinstance(function_args, dict):
+            return None
+        if not self._tool_result_succeeded(function_result):
+            return None
+
+        raw_path = function_args.get("path")
+        if not raw_path:
+            return None
+
+        candidate = Path(os.path.expanduser(str(raw_path)))
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+
+        try:
+            candidate = candidate.resolve(strict=False)
+            plan_root = (Path.cwd() / ".hermes" / "plans").resolve(strict=False)
+            candidate.relative_to(plan_root)
+        except Exception:
+            return None
+
+        if candidate.suffix.lower() != ".md":
+            return None
+        if not candidate.is_file():
+            return None
+        return candidate
+
+    def _preview_plan_with_glow(self, plan_path: Path) -> bool:
+        """Best-effort markdown preview for generated plans using glow."""
+        glow = shutil.which("glow")
+        if not glow:
+            return False
+
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                [glow, str(plan_path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            logger.debug("glow preview failed for %s", plan_path, exc_info=True)
+            return False
+
+        if result.returncode != 0:
+            logger.debug("glow exited %s for %s: %s", result.returncode, plan_path, (result.stderr or "").strip())
+            return False
+
+        output = (result.stdout or "").rstrip()
+        if not output:
+            return False
+
+        try:
+            display_path = plan_path.resolve().relative_to(Path.cwd().resolve())
+        except Exception:
+            display_path = plan_path
+
+        _cprint(f"  ┊ preview plan {display_path}")
+        for line in output.splitlines():
+            _cprint(line)
+        return True
+
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
-        """Render file edits with inline diff after write-capable tools complete."""
+        """Render inline write previews after file-capable tools complete."""
         snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
         try:
             from agent.display import render_edit_diff_with_delta
@@ -5518,6 +5606,17 @@ class HermesCLI:
             )
         except Exception:
             logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+
+        try:
+            plan_path = self._plan_preview_path_from_tool_result(
+                function_name,
+                function_args,
+                function_result,
+            )
+            if plan_path is not None:
+                self._preview_plan_with_glow(plan_path)
+        except Exception:
+            logger.debug("Plan glow preview failed for %s", function_name, exc_info=True)
 
     # ====================================================================
     # Voice mode methods
