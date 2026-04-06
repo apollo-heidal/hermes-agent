@@ -8,6 +8,8 @@ from agent.display import (
     build_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
+    _get_delta_theme_colors,
+    _render_diff_with_delta,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -141,14 +143,60 @@ class TestEditDiffPreview:
         assert "-old" in diff
         assert "+new" in diff
 
+    def test_get_delta_theme_colors_uses_skin_colors(self):
+        fake_skin = MagicMock()
+        fake_skin.get_color.side_effect = lambda key, fallback="": {
+            "ui_ok": "#11aa22",
+            "ui_error": "#cc3344",
+        }.get(key, fallback)
+
+        with patch("hermes_cli.skin_engine.get_active_skin", return_value=fake_skin):
+            plus, minus = _get_delta_theme_colors()
+
+        assert plus == "#11aa22"
+        assert minus == "#cc3344"
+
+    def test_render_diff_with_delta_uses_external_delta_when_available(self):
+        completed = MagicMock(returncode=0, stdout="pretty diff\n", stderr="")
+
+        with patch("agent.display.shutil.which", return_value="/usr/bin/delta"), patch(
+            "agent.display._get_delta_theme_colors",
+            return_value=("#11aa22", "#cc3344"),
+        ), patch(
+            "agent.display.subprocess.run",
+            return_value=completed,
+        ) as run_mock:
+            rendered = _render_diff_with_delta("--- a/x\n+++ b/x\n")
+
+        assert rendered == "pretty diff"
+        run_mock.assert_called_once_with(
+            [
+                "/usr/bin/delta",
+                "--paging=never",
+                "--plus-style", "syntax #11aa22",
+                "--plus-non-emph-style", "syntax #11aa22",
+                "--plus-emph-style", "syntax #11aa22",
+                "--plus-empty-line-marker-style", "normal #11aa22",
+                "--minus-style", "normal #cc3344",
+                "--minus-non-emph-style", "normal #cc3344",
+                "--minus-emph-style", "normal #cc3344",
+                "--minus-empty-line-marker-style", "normal #cc3344",
+            ],
+            input="--- a/x\n+++ b/x\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
     def test_render_edit_diff_with_delta_invokes_printer(self):
         printer = MagicMock()
 
-        rendered = render_edit_diff_with_delta(
-            "patch",
-            '{"diff": "--- a/x\\n+++ b/x\\n@@ -1 +1 @@\\n-old\\n+new\\n"}',
-            print_fn=printer,
-        )
+        with patch("agent.display._render_diff_with_delta", return_value=None):
+            rendered = render_edit_diff_with_delta(
+                "patch",
+                '{"diff": "--- a/x\\n+++ b/x\\n@@ -1 +1 @@\\n-old\\n+new\\n"}',
+                print_fn=printer,
+            )
 
         assert rendered is True
         assert printer.call_count >= 2
@@ -156,6 +204,21 @@ class TestEditDiffPreview:
         assert any("a/x" in line and "b/x" in line for line in calls)
         assert any("old" in line for line in calls)
         assert any("new" in line for line in calls)
+
+    def test_render_edit_diff_with_delta_prefers_external_delta_output(self):
+        printer = MagicMock()
+
+        with patch("agent.display._render_diff_with_delta", return_value="pretty diff") as delta_mock:
+            rendered = render_edit_diff_with_delta(
+                "patch",
+                '{"diff": "--- a/x\\n+++ b/x\\n@@ -1 +1 @@\\n-old\\n+new\\n"}',
+                print_fn=printer,
+            )
+
+        assert rendered is True
+        delta_mock.assert_called_once()
+        calls = [call.args[0] for call in printer.call_args_list]
+        assert calls == ["  ┊ review diff", "pretty diff"]
 
     def test_render_edit_diff_with_delta_skips_without_diff(self):
         rendered = render_edit_diff_with_delta(
@@ -168,6 +231,7 @@ class TestEditDiffPreview:
     def test_render_edit_diff_with_delta_handles_renderer_errors(self, monkeypatch):
         printer = MagicMock()
 
+        monkeypatch.setattr("agent.display._render_diff_with_delta", MagicMock(return_value=None))
         monkeypatch.setattr("agent.display._summarize_rendered_diff_sections", MagicMock(side_effect=RuntimeError("boom")))
 
         rendered = render_edit_diff_with_delta(

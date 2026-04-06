@@ -15,6 +15,7 @@ Usage:
 
 import logging
 import os
+import re
 import shutil
 import sys
 import json
@@ -481,6 +482,7 @@ except Exception:
 
 from rich import box as rich_box
 from rich.console import Console
+from rich.markdown import Markdown as _RichMarkdown
 from rich.markup import escape as _escape
 from rich.panel import Panel
 from rich.text import Text as _RichText
@@ -829,6 +831,41 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     ``[not markup]`` while still interpreting real ANSI color codes.
     """
     return _RichText.from_ansi(text or "")
+
+
+def _looks_like_markdown(text: str) -> bool:
+    """Heuristic: detect markdown-rich assistant output worth Rich rendering."""
+    if not text or not isinstance(text, str):
+        return False
+    if "```" in text:
+        return True
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    markdown_patterns = (
+        r"^#{1,6}\s+",            # headings
+        r"^[-*+]\s+",             # unordered lists
+        r"^\d+[.)]\s+",          # ordered lists
+        r"^>\s+",                 # blockquotes
+        r"^[-*_]{3,}\s*$",        # thematic breaks
+        r"^\|.+\|$",             # tables
+    )
+    return any(re.match(pattern, line) for line in lines for pattern in markdown_patterns)
+
+
+def _render_response_content(text: str):
+    """Return a Rich renderable for assistant responses.
+
+    Prefer ANSI-preserving text when the model emitted terminal escapes; otherwise
+    use Rich Markdown for markdown-structured replies, which gives us code-fence
+    syntax highlighting and nested markdown/list rendering in the response panel.
+    """
+    text = text or ""
+    if "\x1b[" in text:
+        return _rich_text_from_ansi(text)
+    if _looks_like_markdown(text):
+        return _RichMarkdown(text, code_theme="monokai", hyperlinks=True)
+    return _RichText(text)
 
 
 def _cprint(text: str):
@@ -4644,7 +4681,7 @@ class HermesCLI:
 
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response_content(response),
                         title=f"[{_resp_color} bold]{label} (background #{task_num})[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -4767,7 +4804,7 @@ class HermesCLI:
                         _resp_color = "#4F6D4A"
 
                     ChatConsole().print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response_content(response),
                         title=f"[{_resp_color} bold]⚕ /btw[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -5503,94 +5540,6 @@ class HermesCLI:
         except Exception:
             logger.debug("Edit snapshot capture failed for %s", function_name, exc_info=True)
 
-    def _tool_result_succeeded(self, function_result: str | None) -> bool:
-        """Conservatively detect whether a tool result represents success."""
-        if not function_result:
-            return False
-        try:
-            data = json.loads(function_result)
-        except (json.JSONDecodeError, TypeError):
-            return False
-        if not isinstance(data, dict):
-            return False
-        if data.get("error"):
-            return False
-        if "success" in data:
-            return bool(data.get("success"))
-        return True
-
-    def _plan_preview_path_from_tool_result(
-        self,
-        function_name: str,
-        function_args: dict | None,
-        function_result: str | None,
-    ) -> Path | None:
-        """Return a plan markdown path eligible for glow preview, if any."""
-        if function_name != "write_file":
-            return None
-        if not isinstance(function_args, dict):
-            return None
-        if not self._tool_result_succeeded(function_result):
-            return None
-
-        raw_path = function_args.get("path")
-        if not raw_path:
-            return None
-
-        candidate = Path(os.path.expanduser(str(raw_path)))
-        if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
-
-        try:
-            candidate = candidate.resolve(strict=False)
-            plan_root = (Path.cwd() / ".hermes" / "plans").resolve(strict=False)
-            candidate.relative_to(plan_root)
-        except Exception:
-            return None
-
-        if candidate.suffix.lower() != ".md":
-            return None
-        if not candidate.is_file():
-            return None
-        return candidate
-
-    def _preview_plan_with_glow(self, plan_path: Path) -> bool:
-        """Best-effort markdown preview for generated plans using glow."""
-        glow = shutil.which("glow")
-        if not glow:
-            return False
-
-        try:
-            import subprocess
-
-            result = subprocess.run(
-                [glow, str(plan_path)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except Exception:
-            logger.debug("glow preview failed for %s", plan_path, exc_info=True)
-            return False
-
-        if result.returncode != 0:
-            logger.debug("glow exited %s for %s: %s", result.returncode, plan_path, (result.stderr or "").strip())
-            return False
-
-        output = (result.stdout or "").rstrip()
-        if not output:
-            return False
-
-        try:
-            display_path = plan_path.resolve().relative_to(Path.cwd().resolve())
-        except Exception:
-            display_path = plan_path
-
-        _cprint(f"  ┊ preview plan {display_path}")
-        for line in output.splitlines():
-            _cprint(line)
-        return True
-
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
         """Render inline write previews after file-capable tools complete."""
         snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
@@ -5606,17 +5555,6 @@ class HermesCLI:
             )
         except Exception:
             logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
-
-        try:
-            plan_path = self._plan_preview_path_from_tool_result(
-                function_name,
-                function_args,
-                function_result,
-            )
-            if plan_path is not None:
-                self._preview_plan_with_glow(plan_path)
-        except Exception:
-            logger.debug("Plan glow preview failed for %s", function_name, exc_info=True)
 
     # ====================================================================
     # Voice mode methods
@@ -6662,7 +6600,7 @@ class HermesCLI:
                 else:
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _render_response_content(response),
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,

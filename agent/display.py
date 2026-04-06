@@ -7,6 +7,8 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -506,6 +508,56 @@ def _summarize_rendered_diff_sections(
     return rendered
 
 
+def _get_delta_theme_colors() -> tuple[str, str]:
+    """Return (plus_color, minus_color) derived from the active Hermes skin."""
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+
+        skin = get_active_skin()
+        plus = skin.get_color("ui_ok", "#4caf50")
+        minus = skin.get_color("ui_error", "#ef5350")
+        if plus and minus and plus.lower() != minus.lower():
+            return plus, minus
+    except Exception:
+        logger.debug("Could not load active skin colors for delta", exc_info=True)
+    return "#4caf50", "#ef5350"
+
+
+def _render_diff_with_delta(diff: str) -> str | None:
+    """Render unified diff text with external delta when available."""
+    delta = shutil.which("delta")
+    if not delta or not diff:
+        return None
+    plus_color, minus_color = _get_delta_theme_colors()
+    try:
+        result = subprocess.run(
+            [
+                delta,
+                "--paging=never",
+                "--plus-style", f"syntax {plus_color}",
+                "--plus-non-emph-style", f"syntax {plus_color}",
+                "--plus-emph-style", f"syntax {plus_color}",
+                "--plus-empty-line-marker-style", f"normal {plus_color}",
+                "--minus-style", f"normal {minus_color}",
+                "--minus-non-emph-style", f"normal {minus_color}",
+                "--minus-emph-style", f"normal {minus_color}",
+                "--minus-empty-line-marker-style", f"normal {minus_color}",
+            ],
+            input=diff,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.debug("Could not run delta for inline diff: %s", exc)
+        return None
+    if result.returncode != 0:
+        logger.debug("delta exited %s: %s", result.returncode, (result.stderr or "").strip())
+        return None
+    output = (result.stdout or "").rstrip("\n")
+    return output or None
+
+
 def render_edit_diff_with_delta(
     tool_name: str,
     result: str | None,
@@ -523,6 +575,11 @@ def render_edit_diff_with_delta(
     )
     if not diff:
         return False
+
+    delta_rendered = _render_diff_with_delta(diff)
+    if delta_rendered:
+        return _emit_inline_diff(delta_rendered, print_fn)
+
     try:
         rendered_lines = _summarize_rendered_diff_sections(diff)
     except Exception as exc:
